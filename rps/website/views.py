@@ -1,4 +1,4 @@
-from functools import lru_cache
+import gc
 import traceback
 
 import numpy as np
@@ -24,91 +24,8 @@ def camera_page(request):
 
 
 # ============================================================
-# LOAD ALL 4 MODELS
+# MODELS ARE LOADED ONE AT A TIME INSIDE predict()
 # ============================================================
-
-@lru_cache(maxsize=1)
-def get_models():
-
-    models = []
-
-    print("\n")
-    print("==============================================")
-    print("         LOADING RPS MODELS")
-    print("==============================================")
-
-
-    for model_path in settings.MODEL_PATHS[:1]:
-
-        print()
-        print(
-            f"Checking model: {model_path}"
-        )
-
-
-        # ----------------------------------------------------
-        # CHECK FILE
-        # ----------------------------------------------------
-
-        if not model_path.exists():
-
-            raise FileNotFoundError(
-                f"MODEL NOT FOUND:\n{model_path}"
-            )
-
-
-        # ----------------------------------------------------
-        # LOAD MODEL
-        # ----------------------------------------------------
-
-        print(
-            f"Loading model: {model_path.name}"
-        )
-
-
-        model = get_tf().keras.models.load_model(
-            model_path,
-            compile=False
-        )
-
-
-        # ----------------------------------------------------
-        # MODEL INFORMATION
-        # ----------------------------------------------------
-
-        print(
-            f"Loaded successfully: "
-            f"{model_path.name}"
-        )
-
-
-        print(
-            f"Input shape: "
-            f"{model.input_shape}"
-        )
-
-
-        print(
-            f"Output shape: "
-            f"{model.output_shape}"
-        )
-
-
-        models.append(model)
-
-
-    print()
-    print(
-        f"TOTAL MODELS LOADED: {len(models)}"
-    )
-
-    print(
-        "=============================================="
-    )
-    print()
-
-
-    return models
 
 
 # ============================================================
@@ -410,10 +327,10 @@ def predict_with_model(
 
     try:
 
-        raw_prediction = model.predict(
+        raw_prediction = model(
             image_array,
-            verbose=0
-        )
+            training=False
+        ).numpy()
 
     except Exception as error:
 
@@ -572,480 +489,161 @@ def predict_with_model(
 
 @require_POST
 def predict(request):
-
-    print()
-    print()
-    print("================================================")
+    """
+    Run the four-model ensemble sequentially to reduce peak memory use.
+    Only one loaded Keras model is retained at a time.
+    """
+    print("\\n\\n================================================")
     print("         NEW PREDICTION REQUEST")
     print("================================================")
 
-
-    # ========================================================
-    # GET IMAGE
-    # ========================================================
-
-    image_file = request.FILES.get(
-        "image"
-    )
-
-
+    image_file = request.FILES.get("image")
     if image_file is None:
-
-        print(
-            "ERROR: No image received."
-        )
-
-
         return JsonResponse(
-            {
-
-                "ok": False,
-
-                "error":
-                    "No image received."
-
-            },
-
-            status=400
+            {"ok": False, "error": "No image received."},
+            status=400,
         )
 
-
-    print(
-        f"Image name: "
-        f"{image_file.name}"
-    )
-
-
-    print(
-        f"Image size: "
-        f"{image_file.size} bytes"
-    )
-
-
-    # ========================================================
-    # OPEN IMAGE
-    # ========================================================
+    print(f"Image name: {image_file.name}")
+    print(f"Image size: {image_file.size} bytes")
 
     try:
-
-        image = Image.open(
-            image_file
-        ).convert("RGB")
-
-    except (
-        UnidentifiedImageError,
-        OSError
-    ) as error:
-
-        print(
-            f"IMAGE ERROR: {error}"
-        )
-
-
+        image = Image.open(image_file).convert("RGB")
+    except (UnidentifiedImageError, OSError) as error:
+        print(f"IMAGE ERROR: {error}")
         return JsonResponse(
-            {
-
-                "ok": False,
-
-                "error":
-                    "Invalid image."
-
-            },
-
-            status=400
+            {"ok": False, "error": "Invalid image."},
+            status=400,
         )
 
-
-    print(
-        f"Received image dimensions: "
-        f"{image.size}"
-    )
-
-
-    # ========================================================
-    # LOAD ALL MODELS
-    # ========================================================
-
-    try:
-
-        models = get_models()
-
-    except Exception as error:
-
-        print()
-        print(
-            "MODEL LOADING FAILED"
-        )
-
-        traceback.print_exc()
-
-
-        return JsonResponse(
-            {
-
-                "ok": False,
-
-                "error":
-                    f"Model loading failed: {error}"
-
-            },
-
-            status=500
-        )
-
-
-    # ========================================================
-    # CHECK NUMBER OF MODELS
-    # ========================================================
-
-    if len(models) != 1:
-
-        return JsonResponse(
-            {
-
-                "ok": False,
-
-                "error":
-                    f"Expected 4 models, "
-                    f"but loaded {len(models)}."
-
-            },
-
-            status=500
-        )
-
-
-    # ========================================================
-    # RUN ALL 4 MODELS
-    # ========================================================
+    print(f"Received image dimensions: {image.size}")
 
     model_results = []
-
     all_predictions = []
+    tf = None
 
-
-    for index, model in enumerate(
-        models
-    ):
-
-        model_name = (
-            settings
-            .MODEL_PATHS[index]
-            .name
-        )
-
+    # Load, infer, and release each model before loading the next one.
+    for model_path in settings.MODEL_PATHS:
+        model = None
+        model_name = model_path.name
 
         try:
+            print("\\n==============================================")
+            print(f"Loading model: {model_name}")
+            print("==============================================")
 
-            result = (
-                predict_with_model(
-                    model,
-                    image,
-                    model_name
-                )
+            if not model_path.exists():
+                raise FileNotFoundError(f"MODEL NOT FOUND: {model_path}")
+
+            tf = get_tf()
+            model = tf.keras.models.load_model(
+                model_path,
+                compile=False,
             )
 
+            result = predict_with_model(model, image, model_name)
 
-            # ----------------------------------------------
-            # Save probability array
-            # ----------------------------------------------
-
+            # Preserve the probability vector for ensemble averaging.
             all_predictions.append(
-                result[
-                    "_prediction_array"
-                ]
+                np.asarray(
+                    result.pop("_prediction_array"),
+                    dtype=np.float32,
+                ).copy()
             )
+            model_results.append(result)
 
-
-            # ----------------------------------------------
-            # Remove internal NumPy array
-            # ----------------------------------------------
-
-            del result[
-                "_prediction_array"
-            ]
-
-
-            model_results.append(
-                result
-            )
-
+            print(f"Completed model: {model_name}")
 
         except Exception as error:
-
-            print()
-            print(
-                "=============================================="
-            )
-
-            print(
-                f"MODEL FAILED: {model_name}"
-            )
-
-            print(
-                f"ERROR: {error}"
-            )
-
-            print(
-                "=============================================="
-            )
-
-
-            # ------------------------------------------------
-            # IMPORTANT:
-            # We stop here because you requested verification
-            # using ALL 4 models.
-            # ------------------------------------------------
-
+            print(f"MODEL FAILED: {model_name}: {error}")
+            traceback.print_exc()
             return JsonResponse(
                 {
-
                     "ok": False,
-
-                    "error":
-                        f"{model_name} failed during "
-                        f"prediction: {str(error)}"
-
+                    "error": (
+                        f"{model_name} failed during prediction: "
+                        f"{str(error)}"
+                    ),
                 },
-
-                status=500
+                status=500,
             )
 
+        finally:
+            # Drop references before moving to the next model.
+            if model is not None:
+                del model
 
-    # ========================================================
-    # ALL 4 MODELS SUCCESSFUL
-    # ========================================================
+            if tf is not None:
+                try:
+                    tf.keras.backend.clear_session()
+                except Exception:
+                    traceback.print_exc()
 
-    print()
-    print(
-        "=============================================="
-    )
+            gc.collect()
 
-    print(
-        "ALL 4 MODELS PREDICTED SUCCESSFULLY"
-    )
+    if len(model_results) != len(settings.MODEL_PATHS):
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": (
+                    f"Expected {len(settings.MODEL_PATHS)} model results, "
+                    f"got {len(model_results)}."
+                ),
+            },
+            status=500,
+        )
 
-    print(
-        "=============================================="
-    )
+    print("\\nALL MODELS PREDICTED SUCCESSFULLY")
 
+    predictions_array = np.asarray(all_predictions, dtype=np.float32)
+    print(f"Prediction array shape: {predictions_array.shape}")
 
-    # ========================================================
-    # AVERAGE PROBABILITIES
-    # ========================================================
-
-    predictions_array = np.array(
-        all_predictions,
-        dtype=np.float32
-    )
-
-
-    print(
-        f"Prediction array shape: "
-        f"{predictions_array.shape}"
-    )
-
-
-    average_prediction = np.mean(
-        predictions_array,
-        axis=0
-    )
-
-
-    # --------------------------------------------------------
-    # Normalize final probabilities
-    # --------------------------------------------------------
-
-    probability_sum = np.sum(
-        average_prediction
-    )
-
-
+    average_prediction = np.mean(predictions_array, axis=0)
+    probability_sum = float(np.sum(average_prediction))
     if probability_sum > 0:
+        average_prediction = average_prediction / probability_sum
 
-        average_prediction = (
-            average_prediction /
-            probability_sum
-        )
-
-
-    # ========================================================
-    # FINAL PREDICTION
-    # ========================================================
-
-    final_index = int(
-        np.argmax(
-            average_prediction
-        )
-    )
-
-
-    final_prediction = (
-        settings.CLASS_NAMES[
-            final_index
-        ]
-    )
-
-
-    final_confidence = float(
-        average_prediction[
-            final_index
-        ]
-    )
-
-
-    # ========================================================
-    # FINAL PROBABILITIES
-    # ========================================================
+    final_index = int(np.argmax(average_prediction))
+    final_prediction = settings.CLASS_NAMES[final_index]
+    final_confidence = float(average_prediction[final_index])
 
     final_probabilities = {
-
-        "paper":
-            round(
-                float(
-                    average_prediction[0]
-                ) * 100,
-                2
-            ),
-
-        "rock":
-            round(
-                float(
-                    average_prediction[1]
-                ) * 100,
-                2
-            ),
-
-        "scissors":
-            round(
-                float(
-                    average_prediction[2]
-                ) * 100,
-                2
-            )
-
+        "paper": round(float(average_prediction[0]) * 100, 2),
+        "rock": round(float(average_prediction[1]) * 100, 2),
+        "scissors": round(float(average_prediction[2]) * 100, 2),
     }
 
-
-    # ========================================================
-    # MODEL VOTES
-    # ========================================================
-
-    votes = [
-
-        result["prediction"]
-
-        for result in model_results
-
-    ]
-
-
+    votes = [result["prediction"] for result in model_results]
     vote_counts = {
-
-        "paper":
-            votes.count("paper"),
-
-        "rock":
-            votes.count("rock"),
-
-        "scissors":
-            votes.count("scissors")
-
+        "paper": votes.count("paper"),
+        "rock": votes.count("rock"),
+        "scissors": votes.count("scissors"),
     }
+    agreement = max(vote_counts.values())
 
-
-    agreement = max(
-        vote_counts.values()
-    )
-
-
-    # ========================================================
-    # FINAL TERMINAL OUTPUT
-    # ========================================================
-
-    print()
-    print()
-    print(
-        "================================================"
-    )
-
-    print(
-        "             FINAL RPS RESULT"
-    )
-
-    print(
-        "================================================"
-    )
-
-
+    print("\\n================================================")
+    print("             FINAL RPS RESULT")
+    print("================================================")
     for result in model_results:
-
         print(
-            f"{result['model']} -> "
-            f"{result['prediction'].upper()} "
+            f"{result['model']} -> {result['prediction'].upper()} "
             f"({result['confidence']}%)"
         )
 
-
-    print()
-    print(
-        f"FINAL PREDICTION: "
-        f"{final_prediction.upper()}"
-    )
-
-
-    print(
-        f"FINAL CONFIDENCE: "
-        f"{final_confidence * 100:.2f}%"
-    )
-
-
-    print(
-        f"MODEL AGREEMENT: "
-        f"{agreement}/4"
-    )
-
-
-    print(
-        f"FINAL PROBABILITIES: "
-        f"{final_probabilities}"
-    )
-
-
-    print(
-        "================================================"
-    )
-
-
-    # ========================================================
-    # RETURN TO JAVASCRIPT
-    # ========================================================
+    print(f"FINAL PREDICTION: {final_prediction.upper()}")
+    print(f"FINAL CONFIDENCE: {final_confidence * 100:.2f}%")
+    print(f"MODEL AGREEMENT: {agreement}/{len(model_results)}")
+    print(f"FINAL PROBABILITIES: {final_probabilities}")
+    print("================================================")
 
     return JsonResponse(
         {
-
             "ok": True,
-
-            "prediction":
-                final_prediction,
-
-            "confidence":
-                round(
-                    final_confidence * 100,
-                    2
-                ),
-
-            "probabilities":
-                final_probabilities,
-
-            "agreement":
-                agreement,
-
-            "votes":
-                vote_counts,
-
-            "models":
-                model_results
-
+            "prediction": final_prediction,
+            "confidence": round(final_confidence * 100, 2),
+            "probabilities": final_probabilities,
+            "agreement": agreement,
+            "votes": vote_counts,
+            "models": model_results,
         }
     )
